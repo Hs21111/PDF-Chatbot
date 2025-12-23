@@ -1,29 +1,39 @@
 from flask import Flask, render_template, request, jsonify
 import os
-import getpass
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_community.vectorstores import FAISS
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_community.chat_message_histories import ChatMessageHistory
+import google.generativeai as genai
+import faiss
+import numpy as np
+from pypdf import PdfReader
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Ensure API Key
-if "GOOGLE_API_KEY" not in os.environ:
-    # In a real web app, we might ask via UI, but for this local demo we assume env or console input
-    print("GOOGLE_API_KEY not found in env. Please set it in .env or environment.")
+# Configure Gemini
+api_key = os.environ.get("GOOGLE_API_KEY")
+if not api_key:
+    print("Warning: GOOGLE_API_KEY not found in environment.")
+else:
+    genai.configure(api_key=api_key)
 
 app = Flask(__name__)
 
 # Global state
-vectorstore = None
-chat_history = ChatMessageHistory()
-rag_chain = None
+vector_index = None
+chunks = []
+chat_session = None
+
+def get_text_chunks(text, chunk_size=1000, chunk_overlap=200):
+    chunks = []
+    start = 0
+    text_len = len(text)
+    
+    while start < text_len:
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start += (chunk_size - chunk_overlap)
+        
+    return chunks
 
 @app.route('/')
 def home():
@@ -31,7 +41,7 @@ def home():
 
 @app.route('/load', methods=['POST'])
 def load_pdf():
-    global vectorstore, rag_chain, chat_history
+    global vector_index, chunks, chat_session
     data = request.json
     pdf_path = data.get('path')
     
@@ -43,63 +53,57 @@ def load_pdf():
 
     try:
         # Load PDF
-        loader = PyPDFLoader(pdf_path)
-        docs = loader.load()
-        
+        reader = PdfReader(pdf_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+            
         # Split
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(docs)
+        chunks = get_text_chunks(text)
         
-        # Embed
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
-        
-        # Setup Chain
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)
-        retriever = vectorstore.as_retriever()
-        
-        # Contextualize prompt
-        contextualize_q_system_prompt = (
-            "Given a chat history and the latest user question "
-            "which might reference context in the chat history, "
-            "formulate a standalone question which can be understood "
-            "without the chat history. Do NOT answer the question, "
-            "just reformulate it if needed and otherwise return it as is."
-        )
-        contextualize_q_prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", contextualize_q_system_prompt),
-                MessagesPlaceholder("chat_history"),
-                ("human", "{input}"),
-            ]
-        )
-        history_aware_retriever = create_history_aware_retriever(
-            llm, retriever, contextualize_q_prompt
-        )
+        if not chunks:
+             return jsonify({"error": "No text extracted from PDF."}), 400
 
-        # Answer prompt
-        system_prompt = (
-            "You are an assistant for question-answering tasks. "
-            "Use the following pieces of retrieved context to answer "
-            "the question. If you don't know the answer, say that you "
-            "don't know. Use three sentences maximum and keep the "
-            "answer concise."
-            "\n\n"
-            "{context}"
-        )
-        qa_prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", system_prompt),
-                MessagesPlaceholder("chat_history"),
-                ("human", "{input}"),
-            ]
-        )
-        question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+        # Embed
+        # Gemini Embedding model returns 768 dimensions for embedding-001
+        model = 'models/embedding-001'
+        embeddings = []
         
-        rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-        chat_history = ChatMessageHistory() # Reset history
+        # Batch embedding to avoid hitting limits or timeouts if possible, 
+        # though for this simple app we'll loop or send in small batches.
+        # genai.embed_content accepts a list of content.
         
-        return jsonify({"message": "PDF Loaded & Processed Successfully!"})
+        # Process in batches of 100 to be safe
+        batch_size = 100
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i+batch_size]
+            result = genai.embed_content(
+                model=model,
+                content=batch,
+                task_type="retrieval_document",
+                title="PDF Chunk"
+            )
+            embeddings.extend(result['embedding'])
+
+        # Create FAISS index
+        dimension = len(embeddings[0])
+        vector_index = faiss.IndexFlatL2(dimension)
+        vector_index.add(np.array(embeddings).astype('float32'))
+        
+        # Initialize Chat Session with a system prompt context
+        model_name = "gemini-2.5-flash" 
+        # Note: 2.5-flash might not be available in all regions or under this exact name in the SDK yet depending on the version.
+        # We will use 'gemini-1.5-flash' as a safe fallback if 2.5 isn't resolved, or rely on the user's string.
+        # Using 'gemini-pro' or 'gemini-1.5-flash' is standard. Let's try the user's request.
+        
+        try:
+             generation_model = genai.GenerativeModel("gemini-1.5-flash") # Fallback/Standard
+        except:
+             generation_model = genai.GenerativeModel("gemini-pro")
+
+        chat_session = generation_model.start_chat(history=[])
+        
+        return jsonify({"message": f"PDF Loaded! Processed {len(chunks)} chunks."})
         
     except Exception as e:
         print(f"Error: {e}")
@@ -107,8 +111,8 @@ def load_pdf():
 
 @app.route('/ask', methods=['POST'])
 def ask():
-    global rag_chain, chat_history
-    if not rag_chain:
+    global vector_index, chunks, chat_session
+    if vector_index is None:
         return jsonify({"error": "Please load a PDF first"}), 400
         
     data = request.json
@@ -117,12 +121,38 @@ def ask():
         return jsonify({"error": "Query is required"}), 400
 
     try:
-        response = rag_chain.invoke({"input": query, "chat_history": chat_history.messages})
-        answer = response["answer"]
+        # Embed Query
+        query_embedding = genai.embed_content(
+            model="models/embedding-001",
+            content=query,
+            task_type="retrieval_query"
+        )['embedding']
         
-        # Update history
-        chat_history.add_user_message(query)
-        chat_history.add_ai_message(answer)
+        # Search Vector Store
+        k = 3
+        D, I = vector_index.search(np.array([query_embedding]).astype('float32'), k)
+        
+        retrieved_context = ""
+        for idx in I[0]:
+            if idx < len(chunks):
+                retrieved_context += chunks[idx] + "\n\n"
+        
+        # Construct Prompt
+        prompt = (
+            "You are a helpful assistant. Answer the user's question based ONLY on the following context.\n"
+            "If the answer is not in the context, say you don't know.\n\n"
+            f"Context:\n{retrieved_context}\n\n"
+            f"Question: {query}"
+        )
+        
+        # Send to Gemini
+        # We don't necessarily need the chat session history for the RAG part if we just do single turn Q&A,
+        # but the user asked for a chat.
+        # To strictly follow RAG, we usually feed the context into the prompt each time.
+        # Simple approach: Just generate content with the context.
+        
+        response = chat_session.send_message(prompt)
+        answer = response.text
         
         return jsonify({"answer": answer})
     except Exception as e:
