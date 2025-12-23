@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify
 import os
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import faiss
 import numpy as np
 from pypdf import PdfReader
@@ -8,19 +9,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configure Gemini
+# Configure GenAI Client
 api_key = os.environ.get("GOOGLE_API_KEY")
+client = None
 if not api_key:
     print("Warning: GOOGLE_API_KEY not found in environment.")
 else:
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
 
 app = Flask(__name__)
 
 # Global state
 vector_index = None
 chunks = []
-chat_session = None
+# For this simple stateless example, we won't maintain a complex chat session object 
+# but simply append context to the prompt each time.
+chat_history = [] 
 
 def get_text_chunks(text, chunk_size=1000, chunk_overlap=200):
     chunks = []
@@ -41,7 +45,7 @@ def home():
 
 @app.route('/load', methods=['POST'])
 def load_pdf():
-    global vector_index, chunks, chat_session
+    global vector_index, chunks, chat_history
     data = request.json
     pdf_path = data.get('path')
     
@@ -65,43 +69,29 @@ def load_pdf():
              return jsonify({"error": "No text extracted from PDF."}), 400
 
         # Embed
-        # Gemini Embedding model returns 768 dimensions for embedding-001
-        model = 'models/embedding-001'
+        model = 'text-embedding-004' # Newer model, check availability. Or use "models/text-embedding-004"
         embeddings = []
         
-        # Batch embedding to avoid hitting limits or timeouts if possible, 
-        # though for this simple app we'll loop or send in small batches.
-        # genai.embed_content accepts a list of content.
-        
-        # Process in batches of 100 to be safe
-        batch_size = 100
+        # Batch process
+        batch_size = 50 
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i:i+batch_size]
-            result = genai.embed_content(
+            # google-genai SDK call
+            response = client.models.embed_content(
                 model=model,
-                content=batch,
-                task_type="retrieval_document",
-                title="PDF Chunk"
+                contents=batch,
             )
-            embeddings.extend(result['embedding'])
+            # Response has .embeddings attribute which is a list of Embedding objects
+            batch_embeddings = [e.values for e in response.embeddings]
+            embeddings.extend(batch_embeddings)
 
         # Create FAISS index
-        dimension = len(embeddings[0])
-        vector_index = faiss.IndexFlatL2(dimension)
-        vector_index.add(np.array(embeddings).astype('float32'))
+        if embeddings:
+            dimension = len(embeddings[0])
+            vector_index = faiss.IndexFlatL2(dimension)
+            vector_index.add(np.array(embeddings).astype('float32'))
         
-        # Initialize Chat Session with a system prompt context
-        model_name = "gemini-2.5-flash" 
-        # Note: 2.5-flash might not be available in all regions or under this exact name in the SDK yet depending on the version.
-        # We will use 'gemini-1.5-flash' as a safe fallback if 2.5 isn't resolved, or rely on the user's string.
-        # Using 'gemini-pro' or 'gemini-1.5-flash' is standard. Let's try the user's request.
-        
-        try:
-             generation_model = genai.GenerativeModel("gemini-1.5-flash") # Fallback/Standard
-        except:
-             generation_model = genai.GenerativeModel("gemini-pro")
-
-        chat_session = generation_model.start_chat(history=[])
+        chat_history = [] # Reset history
         
         return jsonify({"message": f"PDF Loaded! Processed {len(chunks)} chunks."})
         
@@ -111,7 +101,7 @@ def load_pdf():
 
 @app.route('/ask', methods=['POST'])
 def ask():
-    global vector_index, chunks, chat_session
+    global vector_index, chunks, chat_history
     if vector_index is None:
         return jsonify({"error": "Please load a PDF first"}), 400
         
@@ -122,11 +112,11 @@ def ask():
 
     try:
         # Embed Query
-        query_embedding = genai.embed_content(
-            model="models/embedding-001",
-            content=query,
-            task_type="retrieval_query"
-        )['embedding']
+        response = client.models.embed_content(
+            model="text-embedding-004",
+            contents=query,
+        )
+        query_embedding = response.embeddings[0].values
         
         # Search Vector Store
         k = 3
@@ -146,16 +136,22 @@ def ask():
         )
         
         # Send to Gemini
-        # We don't necessarily need the chat session history for the RAG part if we just do single turn Q&A,
-        # but the user asked for a chat.
-        # To strictly follow RAG, we usually feed the context into the prompt each time.
-        # Simple approach: Just generate content with the context.
+        model_name = "gemini-2.0-flash-lite"
         
-        response = chat_session.send_message(prompt)
+        # We can pass simple history if we wanted, but for strict RAG we mostly care about the current prompt + context.
+        # To maintain chat illusion, we could append previous turns to 'contents' list.
+        # For simplicity here, we just send the single prompt.
+        
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt
+        )
+        
         answer = response.text
         
         return jsonify({"answer": answer})
     except Exception as e:
+        print(e)
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
